@@ -24,8 +24,8 @@ impl Tokenizer {
     pub fn encode(&mut self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
 
-        for word in normalized_words(text) {
-            for token in ngrams_for_word(&word, self.max_ngram) {
+        for term in normalized_terms(text) {
+            for token in tokens_for_term(&term, self.max_ngram) {
                 ids.push(self.get_or_insert(token));
             }
         }
@@ -34,9 +34,9 @@ impl Tokenizer {
     }
 
     pub fn encode_deterministic(&self, text: &str) -> Vec<u32> {
-        normalized_words(text)
+        normalized_terms(text)
             .into_iter()
-            .flat_map(|word| ngrams_for_word(&word, self.max_ngram))
+            .flat_map(|term| tokens_for_term(&term, self.max_ngram))
             .filter_map(|token| self.vocab.get(&token).copied())
             .collect()
     }
@@ -82,22 +82,66 @@ impl Default for Tokenizer {
     }
 }
 
-fn normalized_words(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .filter_map(|raw| {
-            let cleaned = raw
-                .chars()
-                .filter(|ch| ch.is_alphanumeric())
-                .flat_map(char::to_lowercase)
-                .collect::<String>();
+fn normalized_terms(text: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
 
-            if cleaned.is_empty() {
-                None
-            } else {
-                Some(cleaned)
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            for lowered in ch.to_lowercase() {
+                current.push(lowered);
             }
-        })
-        .collect()
+        } else if !current.is_empty() {
+            terms.push(std::mem::take(&mut current));
+        }
+    }
+
+    if !current.is_empty() {
+        terms.push(current);
+    }
+
+    terms
+}
+
+fn tokens_for_term(term: &str, max_ngram: usize) -> Vec<String> {
+    if contains_cjk(term) {
+        cjk_ngrams_for_term(term, max_ngram)
+    } else {
+        ngrams_for_word(term, max_ngram)
+    }
+}
+
+fn cjk_ngrams_for_term(term: &str, max_ngram: usize) -> Vec<String> {
+    let chars = term.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+
+    for start in 0..chars.len() {
+        let max_len = max_ngram.min(chars.len() - start);
+        for len in 1..=max_len {
+            tokens.push(chars[start..start + len].iter().collect());
+        }
+    }
+
+    tokens.push(format!("#{term}"));
+    tokens
+}
+
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(is_cjk)
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{20000}'..='\u{2A6DF}'
+            | '\u{2A700}'..='\u{2B73F}'
+            | '\u{2B740}'..='\u{2B81F}'
+            | '\u{2B820}'..='\u{2CEAF}'
+            | '\u{2CEB0}'..='\u{2EBEF}'
+    )
 }
 
 fn ngrams_for_word(word: &str, max_ngram: usize) -> Vec<String> {
@@ -208,5 +252,34 @@ mod tests {
 
         assert!(!ids.is_empty());
         assert_eq!(decoded, "मनस");
+    }
+
+    #[test]
+    fn chinese_text_uses_sliding_character_ngrams() {
+        let mut tokenizer = Tokenizer::new(4);
+
+        let ids = tokenizer.encode("山是由构造力形成的");
+        let tokens = ids
+            .iter()
+            .filter_map(|id| tokenizer.id_to_token.get(id))
+            .cloned()
+            .collect::<HashSet<_>>();
+
+        assert!(tokens.contains("山"));
+        assert!(tokens.contains("构造"));
+        assert!(tokens.contains("形成"));
+        assert!(tokens.contains("#山是由构造力形成的"));
+    }
+
+    #[test]
+    fn chinese_related_phrases_share_tokens() {
+        let mut tokenizer = Tokenizer::new(4);
+
+        let first = tokenizer.encode("山是怎么形成的");
+        let second = tokenizer.encode("山是由构造力形成的");
+
+        let first_set = first.into_iter().collect::<HashSet<_>>();
+        let second_set = second.into_iter().collect::<HashSet<_>>();
+        assert!(first_set.intersection(&second_set).count() >= 3);
     }
 }

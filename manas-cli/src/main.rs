@@ -402,7 +402,7 @@ fn teachable_units(text: &str) -> Vec<String> {
 
     for ch in text.chars() {
         current.push(ch);
-        if matches!(ch, '.' | '!' | '?' | '\n') {
+        if matches!(ch, '.' | '!' | '?' | '。' | '！' | '\n') {
             push_teachable_unit(&mut units, &mut current);
         }
     }
@@ -432,11 +432,23 @@ fn extract_association(text: &str) -> Result<(String, String), String> {
         return Err("input text is empty".to_string());
     }
 
+    if let Some((input, target)) = extract_qa_association(&cleaned) {
+        return Ok((input, target));
+    }
+
     let lower = cleaned.to_lowercase();
     for marker in [" refers to ", " means ", " were ", " was ", " are ", " is "] {
         if let Some(index) = lower.find(marker) {
             let input = strip_leading_article(&cleaned[..index]);
             let target = strip_leading_article(&cleaned[index + marker.len()..]);
+            if !input.is_empty() && !target.is_empty() {
+                return Ok((input, target));
+            }
+        }
+    }
+
+    for marker in ["指的是", "意味着", "叫做", "位于", "属于", "是"] {
+        if let Some((input, target)) = split_marker_association(&cleaned, marker) {
             if !input.is_empty() && !target.is_empty() {
                 return Ok((input, target));
             }
@@ -450,9 +462,59 @@ fn extract_association(text: &str) -> Result<(String, String), String> {
     Ok((input, cleaned))
 }
 
+fn extract_qa_association(text: &str) -> Option<(String, String)> {
+    for (question_marker, answer_marker) in [
+        ("问题:", "答案:"),
+        ("问题：", "答案："),
+        ("问题:", "答案："),
+        ("问题：", "答案:"),
+        ("Q:", "A:"),
+        ("Q：", "A："),
+    ] {
+        if let Some(rest) = text.strip_prefix(question_marker) {
+            if let Some((question, answer)) = rest.split_once(answer_marker) {
+                let input = trim_sentence(question);
+                let target = trim_sentence(answer);
+                if !input.is_empty() && !target.is_empty() {
+                    return Some((input, target));
+                }
+            }
+        }
+    }
+
+    for separator in [" : ", " ： ", "：", ":"] {
+        if let Some((question, answer)) = text.split_once(separator) {
+            let input = trim_sentence(question);
+            let target = trim_sentence(answer);
+            if looks_like_question_or_short_key(&input) && !target.is_empty() {
+                return Some((input, target));
+            }
+        }
+    }
+
+    None
+}
+
+fn looks_like_question_or_short_key(text: &str) -> bool {
+    text.contains('?')
+        || text.contains('？')
+        || text.chars().count() <= 32
+}
+
+fn split_marker_association(text: &str, marker: &str) -> Option<(String, String)> {
+    let (input, target) = text.split_once(marker)?;
+    Some((trim_sentence(input), trim_sentence(target)))
+}
+
 fn trim_sentence(text: &str) -> String {
     text.trim()
-        .trim_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\''))
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\''
+                    | '。' | '，' | '；' | '：' | '！' | '？' | '“' | '”' | '‘' | '’'
+            )
+        })
         .trim()
         .to_string()
 }
@@ -557,5 +619,35 @@ mod tests {
 
         assert_eq!(input, "Eiffel Tower");
         assert_eq!(target, "located in Paris France");
+    }
+
+    #[test]
+    fn extracts_chinese_question_answer_association() {
+        let (input, target) = extract_association(
+            "问题：山是怎么形成的？ 答案：山是由构造力或火山活动经过漫长地质时期形成的。",
+        )
+        .unwrap();
+
+        assert_eq!(input, "山是怎么形成的");
+        assert_eq!(target, "山是由构造力或火山活动经过漫长地质时期形成的");
+    }
+
+    #[test]
+    fn extracts_colon_question_answer_association() {
+        let (input, target) = extract_association(
+            "长城为什么而建？ : 中国长城是为保护古代中国免受入侵而建造的。",
+        )
+        .unwrap();
+
+        assert_eq!(input, "长城为什么而建");
+        assert_eq!(target, "中国长城是为保护古代中国免受入侵而建造的");
+    }
+
+    #[test]
+    fn extracts_chinese_is_association() {
+        let (input, target) = extract_association("猫是家养哺乳动物。").unwrap();
+
+        assert_eq!(input, "猫");
+        assert_eq!(target, "家养哺乳动物");
     }
 }
