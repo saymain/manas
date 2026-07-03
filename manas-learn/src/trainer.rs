@@ -10,6 +10,7 @@ use crate::encoder::Encoder;
 const DEFAULT_EMBED_TABLE_SIZE: usize = 8192;
 const OPEN_TO_GUARDED_ACTIVATIONS: u64 = 500;
 const GUARDED_TO_FROZEN_ACTIVATIONS: u64 = 2_000;
+const CONSOLIDATE_NEURONS_PER_FACT: usize = 1;
 
 /// Encoded input-target fact used by Stage 3 training.
 #[derive(Clone, Debug)]
@@ -130,6 +131,22 @@ impl Trainer {
             loss_after = loss_for_fact(network, &fact)?;
         }
 
+        if !has_open_hidden_neurons(network)
+            && !has_matching_frozen_hidden_input(network, &fact.input)
+        {
+            grow_for_fact(network, &fact)?;
+            neurons_grown += 1;
+            update_applied = true;
+            loss_after = loss_for_fact(network, &fact)?;
+        }
+
+        if loss_after > self.growth_threshold && !has_open_hidden_neurons(network) {
+            grow_for_fact(network, &fact)?;
+            neurons_grown += 1;
+            update_applied = true;
+            loss_after = loss_for_fact(network, &fact)?;
+        }
+
         if loss_after > self.growth_threshold {
             for _ in 0..self.max_update_attempts {
                 let (_, gradients) = compute_gradients(network, &fact.input, &fact.target)?;
@@ -158,13 +175,28 @@ impl Trainer {
         let protection_report = self.update_protection_levels(network);
         assign_source_to_best_hidden(network, &fact.input, source);
 
+        let mut neurons_frozen = protection_report.neurons_frozen;
+
+        if neurons_grown > 0 && !has_guarded_hidden_neurons(network) {
+            let consolidation_report = network.consolidate_anchor_facts(
+                &[TrainingExample {
+                    input: &fact.input,
+                    target: &fact.target,
+                }],
+                CONSOLIDATE_NEURONS_PER_FACT,
+            )?;
+
+            neurons_frozen =
+                neurons_frozen.saturating_add(consolidation_report.frozen_hidden_neurons as u32);
+        }
+
         Ok(LearnReport {
             loss_before,
             loss_after,
             neurons_grown,
             layers_grown: 0,
             neurons_promoted: protection_report.neurons_promoted,
-            neurons_frozen: protection_report.neurons_frozen,
+            neurons_frozen,
             total_neurons: network.neuron_count(),
             update_applied,
         })
@@ -257,20 +289,37 @@ impl Trainer {
     }
 
     pub fn query(&self, network: &Network, question: &str) -> Result<QueryResult, ManasError> {
-        let input = self.encoder.encode_deterministic(question);
-        if input.iter().all(|value| value.abs() <= f32::EPSILON) || network.neuron_count() == 0 {
+        if network.neuron_count() == 0 {
             return Ok(not_enough());
         }
 
-        let output = network.forward(&input);
-        Ok(match decode_answer(&output, &self.encoder, question) {
-            Some(decoded) => QueryResult {
-                answer: decoded.answer,
-                confidence: decoded.confidence,
-                answered_from: AnswerSource::NeuralWeights,
-            },
-            None => not_enough(),
-        })
+        let mut best: Option<QueryResult> = None;
+
+        for candidate in query_candidates(question) {
+            let input = self.encoder.encode_deterministic(&candidate);
+            if input.iter().all(|value| value.abs() <= f32::EPSILON) {
+                continue;
+            }
+
+            let output = network.forward(&input);
+            if let Some(decoded) = decode_answer(&output, &self.encoder, &candidate) {
+                let result = QueryResult {
+                    answer: decoded.answer,
+                    confidence: decoded.confidence,
+                    answered_from: AnswerSource::NeuralWeights,
+                };
+
+                if best
+                    .as_ref()
+                    .map(|current| result.confidence > current.confidence)
+                    .unwrap_or(true)
+                {
+                    best = Some(result);
+                }
+            }
+        }
+
+        Ok(best.unwrap_or_else(not_enough))
     }
 
     pub fn similarity_for_fact(&self, network: &Network, fact: &EncodedFact) -> f32 {
@@ -303,6 +352,149 @@ fn not_enough() -> QueryResult {
         confidence: 0.0,
         answered_from: AnswerSource::NotEnough,
     }
+}
+
+fn has_open_hidden_neurons(network: &Network) -> bool {
+    network
+        .layers
+        .first()
+        .map(|layer| {
+            layer
+                .neurons
+                .iter()
+                .any(|neuron| matches!(neuron.protection_level, ProtectionLevel::Open))
+        })
+        .unwrap_or(false)
+}
+
+fn has_guarded_hidden_neurons(network: &Network) -> bool {
+    network
+        .layers
+        .first()
+        .map(|layer| {
+            layer
+                .neurons
+                .iter()
+                .any(|neuron| matches!(neuron.protection_level, ProtectionLevel::Guarded))
+        })
+        .unwrap_or(false)
+}
+
+fn has_matching_frozen_hidden_input(network: &Network, input: &[f32]) -> bool {
+    const MATCH_THRESHOLD: f32 = 0.80;
+
+    network
+        .layers
+        .first()
+        .map(|layer| {
+            layer.neurons.iter().any(|neuron| {
+                matches!(neuron.protection_level, ProtectionLevel::Frozen)
+                    && neuron.activate(input) >= MATCH_THRESHOLD
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn query_candidates(question: &str) -> Vec<String> {
+    let cleaned = trim_query_text(question);
+    let mut candidates = Vec::new();
+
+    if !cleaned.is_empty() {
+        candidates.push(cleaned.clone());
+    }
+
+    let key_phrase = cleaned
+        .split_whitespace()
+        .filter_map(|raw| {
+            let normalized = raw
+                .chars()
+                .filter(|ch| ch.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>();
+
+            if normalized.is_empty() || is_query_stopword(&normalized) {
+                None
+            } else {
+                let original = raw
+                    .chars()
+                    .filter(|ch| ch.is_alphanumeric())
+                    .collect::<String>();
+
+                if original.is_empty() {
+                    None
+                } else {
+                    Some(original)
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if !key_phrase.is_empty() && key_phrase != cleaned {
+        candidates.push(key_phrase);
+    }
+
+    candidates
+}
+
+fn trim_query_text(text: &str) -> String {
+    text.trim()
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '.' | ','
+                    | ';'
+                    | ':'
+                    | '!'
+                    | '?'
+                    | '"'
+                    | '\''
+                    | '。'
+                    | '，'
+                    | '；'
+                    | '：'
+                    | '！'
+                    | '？'
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
+            )
+        })
+        .trim()
+        .to_string()
+}
+
+fn is_query_stopword(word: &str) -> bool {
+    matches!(
+        word,
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "by"
+            | "for"
+            | "from"
+            | "in"
+            | "is"
+            | "it"
+            | "of"
+            | "on"
+            | "or"
+            | "the"
+            | "to"
+            | "was"
+            | "were"
+            | "what"
+            | "when"
+            | "where"
+            | "who"
+            | "why"
+            | "how"
+            | "with"
+    )
 }
 
 fn grow_for_fact(network: &mut Network, fact: &EncodedFact) -> Result<(), ManasError> {
@@ -400,7 +592,7 @@ mod tests {
 
         assert_eq!(report.layers_grown, 0);
         assert_eq!(report.neurons_promoted, 0);
-        assert_eq!(report.neurons_frozen, 0);
+        assert!(report.neurons_frozen >= 1);
         assert_eq!(report.total_neurons, network.neuron_count());
         assert!(report.loss_before >= report.loss_after);
     }

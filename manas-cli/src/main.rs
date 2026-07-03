@@ -420,7 +420,7 @@ fn teachable_units(text: &str) -> Vec<String> {
 
 fn push_teachable_unit(units: &mut Vec<String>, current: &mut String) {
     let unit = current.trim();
-    if !unit.is_empty() {
+    if !unit.is_empty() && !is_markdown_heading(unit) {
         units.push(unit.to_string());
     }
     current.clear();
@@ -439,7 +439,7 @@ fn extract_association(text: &str) -> Result<(String, String), String> {
     let lower = cleaned.to_lowercase();
     for marker in [" refers to ", " means ", " were ", " was ", " are ", " is "] {
         if let Some(index) = lower.find(marker) {
-            let input = strip_leading_article(&cleaned[..index]);
+            let input = normalize_repeated_subject(&strip_leading_article(&cleaned[..index]));
             let target = strip_leading_article(&cleaned[index + marker.len()..]);
             if !input.is_empty() && !target.is_empty() {
                 return Ok((input, target));
@@ -460,6 +460,27 @@ fn extract_association(text: &str) -> Result<(String, String), String> {
         .find(|word| !is_stopword(word))
         .ok_or_else(|| "could not find a teachable subject".to_string())?;
     Ok((input, cleaned))
+}
+
+fn normalize_repeated_subject(text: &str) -> String {
+    let trimmed = trim_sentence(text);
+    let words = trimmed.split_whitespace().collect::<Vec<_>>();
+
+    if words.len() >= 2 && words.len() % 2 == 0 {
+        let midpoint = words.len() / 2;
+        let first = &words[..midpoint];
+        let second = &words[midpoint..];
+
+        if first
+            .iter()
+            .zip(second.iter())
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        {
+            return first.join(" ");
+        }
+    }
+
+    trimmed
 }
 
 fn extract_qa_association(text: &str) -> Option<(String, String)> {
@@ -496,9 +517,7 @@ fn extract_qa_association(text: &str) -> Option<(String, String)> {
 }
 
 fn looks_like_question_or_short_key(text: &str) -> bool {
-    text.contains('?')
-        || text.contains('？')
-        || text.chars().count() <= 32
+    text.contains('?') || text.contains('？') || text.chars().count() <= 32
 }
 
 fn split_marker_association(text: &str, marker: &str) -> Option<(String, String)> {
@@ -511,8 +530,23 @@ fn trim_sentence(text: &str) -> String {
         .trim_matches(|ch: char| {
             matches!(
                 ch,
-                '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\''
-                    | '。' | '，' | '；' | '：' | '！' | '？' | '“' | '”' | '‘' | '’'
+                '.' | ','
+                    | ';'
+                    | ':'
+                    | '!'
+                    | '?'
+                    | '"'
+                    | '\''
+                    | '。'
+                    | '，'
+                    | '；'
+                    | '：'
+                    | '！'
+                    | '？'
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
             )
         })
         .trim()
@@ -599,6 +633,18 @@ fn known_sidecar_paths(brain_path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn is_markdown_heading(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let heading_marks = trimmed.chars().take_while(|ch| *ch == '#').count();
+
+    (1..=6).contains(&heading_marks)
+        && trimmed
+            .chars()
+            .nth(heading_marks)
+            .map(char::is_whitespace)
+            .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,10 +680,9 @@ mod tests {
 
     #[test]
     fn extracts_colon_question_answer_association() {
-        let (input, target) = extract_association(
-            "长城为什么而建？ : 中国长城是为保护古代中国免受入侵而建造的。",
-        )
-        .unwrap();
+        let (input, target) =
+            extract_association("长城为什么而建？ : 中国长城是为保护古代中国免受入侵而建造的。")
+                .unwrap();
 
         assert_eq!(input, "长城为什么而建");
         assert_eq!(target, "中国长城是为保护古代中国免受入侵而建造的");
@@ -649,5 +694,20 @@ mod tests {
 
         assert_eq!(input, "猫");
         assert_eq!(target, "家养哺乳动物");
+    }
+
+    #[test]
+    fn skips_markdown_headings_as_teachable_units() {
+        let units = teachable_units("# Paris\n\nParis is a city in France.");
+
+        assert_eq!(units, vec!["Paris is a city in France."]);
+    }
+
+    #[test]
+    fn extracts_duplicate_markdown_heading_subject() {
+        let (input, target) = extract_association("Paris Paris is a city in France.").unwrap();
+
+        assert_eq!(input, "Paris");
+        assert_eq!(target, "city in France");
     }
 }

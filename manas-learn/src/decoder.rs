@@ -5,6 +5,7 @@ use crate::encoder::Encoder;
 
 pub const MIN_QUERY_CONFIDENCE: f32 = 0.25;
 const MAX_ANSWER_WORDS: usize = 6;
+const STRONG_PHRASE_CONFIDENCE: f32 = 0.92;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecodedAnswer {
@@ -42,9 +43,18 @@ pub fn decode_answer(output: &[f32], encoder: &Encoder, question: &str) -> Optio
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let best_score = candidates.first().map(|(_, score)| *score)?;
+    let (best_word, best_score) = candidates
+        .first()
+        .map(|(word, score)| (word.clone(), *score))?;
     if best_score < MIN_QUERY_CONFIDENCE {
         return None;
+    }
+
+    if best_score >= STRONG_PHRASE_CONFIDENCE && should_return_best_candidate_only(&best_word) {
+        return Some(DecodedAnswer {
+            answer: best_word,
+            confidence: best_score.clamp(0.0, 1.0),
+        });
     }
 
     let threshold = (best_score * 0.55).max(MIN_QUERY_CONFIDENCE * 0.75);
@@ -74,6 +84,28 @@ pub fn decode_answer(output: &[f32], encoder: &Encoder, question: &str) -> Optio
         answer: words.join(" "),
         confidence: best_score.clamp(0.0, 1.0),
     })
+}
+
+fn should_return_best_candidate_only(candidate: &str) -> bool {
+    contains_cjk(candidate) || candidate.chars().count() > 12
+}
+
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(is_cjk)
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{20000}'..='\u{2A6DF}'
+            | '\u{2A700}'..='\u{2B73F}'
+            | '\u{2B740}'..='\u{2B81F}'
+            | '\u{2B820}'..='\u{2CEAF}'
+            | '\u{2CEB0}'..='\u{2EBEF}'
+    )
 }
 
 fn normalized_words(text: &str) -> Vec<String> {
